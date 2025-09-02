@@ -122,7 +122,7 @@ export default {
             error: '',
             view: {},
             live: false,
-            ws: null,
+            liveInterval: null,
             query: {
                 view: q.view || 'messages',
                 agent: q.agent !== undefined ? q.agent : true,
@@ -259,114 +259,114 @@ export default {
                 }
             });
         },
-        streamUrl() {
-            const projectId = this.$route.params.projectId;
-            const q = JSON.stringify({ agent: this.query.agent, otel: this.query.otel, filters: this.query.filters, limit: this.query.limit });
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const host = window.location.host;
-            return `${protocol}//${host}${this.$coroot.base_path}api/project/${projectId}/overview/logs/ws?query=${encodeURIComponent(q)}`;
+        buildLogsQuery() {
+            return JSON.stringify({
+                agent: this.query.agent,
+                otel: this.query.otel,
+                filters: this.query.filters,
+                limit: this.query.limit,
+                view: 'messages'
+            });
         },
         startLive() {
-            if (this.ws) return;
+            if (this.liveInterval) return;
             
-            try {
-                this.ws = new WebSocket(this.streamUrl());
-            } catch (e) {
-                console.error('WebSocket connection failed:', e);
-                this.live = false;
-                return;
-            }
-
-            this.ws.onopen = () => {
-                console.log('WebSocket connected - logs streaming started');
-                this.live = true;
-            };
-
-            this.ws.onmessage = (ev) => {
-                try {
-                    const data = JSON.parse(ev.data);
-                    
-                    // Ignore system messages
-                    if (data.type === 'connected') {
-                        console.log('Logs WebSocket connected successfully');
+            this.live = true;
+            
+            let lastTimestamp = Date.now() * 1000; // Convert to microseconds for ClickHouse
+            
+            const pollLogs = () => {
+                if (!this.live) return;
+                
+                const now = Date.now() * 1000; // Current time in microseconds
+                
+                // Adjust time range: from last timestamp + 1μs to now
+                const timeParams = {
+                    from: Math.floor(lastTimestamp / 1000) + 1, // Convert back to milliseconds and add 1ms
+                    to: Math.floor(now / 1000)
+                };
+                
+                // Create query with time range - same approach as AppLogs.vue
+                const liveQuery = {
+                    ...this.query,
+                    from: timeParams.from,
+                    to: timeParams.to
+                };
+                
+                // Use $api.getOverview like the regular get() method, but with time range
+                this.$api.getOverview('logs', JSON.stringify(liveQuery), (data, error) => {
+                    if (error) {
+                        console.error('Live logs polling error:', error);
                         return;
                     }
                     
-                    if (data.error) {
-                        console.error('WebSocket error:', data.error);
-                        this.stopLive();
+                    if (data.status === 'warning') {
+                        console.warn('Live logs warning:', data.message);
                         return;
                     }
                     
-                    // Process real-time logs
-                    if (data.type === 'log') {
-                        const message = (data.message || '').trim();
-                        const newline = message.indexOf('\n');
-                        let application = data.application;
-                        let link;
-                        
-                        if (application && application.includes(':')) {
-                            const id = this.$utils.appId(application);
-                            application = id.name;
-                            link = { 
-                                name: 'overview', 
-                                params: { view: 'applications', id: data.application, report: 'Logs' }, 
-                                query: this.$utils.contextQuery() 
+                    // Process new entries - check both possible structures
+                    const entries = data.logs?.entries || data.entries;
+                    if (entries && entries.length > 0) {
+                        const newEntries = entries.map((e) => {
+                            const message = (e.message || '').trim();
+                            const newline = message.indexOf('\n');
+                            let application = e.application;
+                            let link;
+                            
+                            if (application && application.includes(':')) {
+                                const id = this.$utils.appId(application);
+                                application = id.name;
+                                link = { 
+                                    name: 'overview', 
+                                    params: { view: 'applications', id: e.application, report: 'Logs' }, 
+                                    query: this.$utils.contextQuery() 
+                                };
+                            }
+                            
+                            return {
+                                ...e,
+                                application,
+                                link,
+                                message,
+                                color: palette.get(e.color),
+                                date: this.$format.date(e.timestamp, '{MMM} {DD} {HH}:{mm}:{ss}'),
+                                multiline: newline > 0 ? newline : 0,
                             };
-                        }
-                        
-                        const entry = {
-                            ...data,
-                            application,
-                            link,
-                            message,
-                            color: palette.get(data.color),
-                            date: this.$format.date(data.timestamp, '{MMM} {DD} {HH}:{mm}:{ss}'),
-                            multiline: newline > 0 ? newline : 0,
-                        };
+                        });
                         
                         if (!this.view.entries) {
                             this.$set(this.view, 'entries', []);
                         }
                         
-                        this.view.entries.push(entry);
+                        // Add new entries to the end (chronological order)
+                        this.view.entries.push(...newEntries);
                         
-                        // Keep limit of entries on screen
+                        // Update last timestamp to the newest entry
+                        const timestamps = entries.map(e => new Date(e.timestamp).getTime() * 1000);
+                        if (timestamps.length > 0) {
+                            lastTimestamp = Math.max(...timestamps);
+                        }
+                        
+                        // Keep limit of entries on screen - remove oldest entries
                         if (this.view.entries.length > this.query.limit) {
                             this.view.entries.splice(0, this.view.entries.length - this.query.limit);
                         }
+                    } else {
+                        // Update timestamp even if no new entries
+                        lastTimestamp = now;
                     }
-                } catch (e) {
-                    console.error('Error processing WebSocket message:', e);
-                }
+                });
             };
-
-            this.ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                this.stopLive();
-            };
-
-            this.ws.onclose = (event) => {
-                console.log('WebSocket closed:', event.code, event.reason);
-                this.live = false;
-                
-                // Auto-reconnect if not closed intentionally
-                if (event.code !== 1000 && this.live) {
-                    setTimeout(() => {
-                        console.log('Attempting WebSocket reconnection...');
-                        this.startLive();
-                    }, 2000);
-                }
-            };
+            
+            // Initial poll and set up interval for every 2 seconds
+            pollLogs();
+            this.liveInterval = setInterval(pollLogs, 2000);
         },
         stopLive() {
-            if (this.ws) { 
-                try { 
-                    this.ws.close(1000, 'User stopped live logs'); 
-                } catch (e) { 
-                    console.debug('Error closing WebSocket:', e); 
-                } 
-                this.ws = null; 
+            if (this.liveInterval) {
+                clearInterval(this.liveInterval);
+                this.liveInterval = null;
             }
             this.live = false;
         },
